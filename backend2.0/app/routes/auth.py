@@ -1,0 +1,182 @@
+from flask import Blueprint, jsonify, request, redirect, url_for, session, current_app
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_mail import Message
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
+from ..models.user_model import User
+from ..extensions import db, mail, oauth
+
+auth_bp = Blueprint('auth', __name__)
+
+
+def generate_reset_token(email):
+    serializer = URLSafeTimedSerializer(current_app.config['SECRET_KEY'])
+    return serializer.dumps(email, salt='password-reset-salt')
+
+
+def confirm_reset_token(token, expiration=3600):
+    serializer = URLSafeTimedSerializer(current_app.config['SECRET_KEY'])
+    try:
+        email = serializer.loads(token, salt='password-reset-salt', max_age=expiration)
+        return email
+    except (SignatureExpired, BadTimeSignature):
+        return None
+
+
+@auth_bp.route("/login", methods=["POST"])
+def login():
+    from flask_jwt_extended import create_access_token
+    data = request.json
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+
+    user = User.query.filter_by(email=email).first()
+    if not user or not check_password_hash(user.password_hash, password):
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    access_token = create_access_token(identity=str(user.id))
+    return jsonify({
+        "access_token": access_token,
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "role": getattr(user, 'role', 'user')
+        }
+    }), 200
+
+
+@auth_bp.route("/register", methods=["POST"])
+def register():
+    from flask_jwt_extended import create_access_token
+    data = request.json
+    username = data.get("username")
+    email = data.get("email")
+    password = data.get("password")
+
+    if not all([username, email, password]):
+        return jsonify({"error": "All fields are required"}), 400
+
+    if User.query.filter_by(email=email).first():
+        return jsonify({"error": "Email already registered"}), 409
+
+    if User.query.filter_by(username=username).first():
+        return jsonify({"error": "Username already taken"}), 409
+
+    new_user = User(username=username, email=email)
+    new_user.password_hash = generate_password_hash(password)
+    db.session.add(new_user)
+    db.session.commit()
+
+    access_token = create_access_token(identity=str(new_user.id))
+    return jsonify({
+        "access_token": access_token,
+        "user": {
+            "id": new_user.id,
+            "username": new_user.username,
+            "email": new_user.email
+        }
+    }), 201
+
+
+@auth_bp.route('/google/login')
+def google_login():
+    redirect_uri = url_for('auth.google_authorized', _external=True)
+    return oauth.google.authorize_redirect(redirect_uri)
+
+
+@auth_bp.route('/google/authorized')
+def google_authorized():
+    from flask_jwt_extended import create_access_token
+    try:
+        token = oauth.google.authorize_access_token()
+        userinfo = token.get('userinfo')
+        if not userinfo:
+            resp = oauth.google.get('https://www.googleapis.com/oauth2/v3/userinfo')
+            userinfo = resp.json()
+    except Exception as e:
+         print("GOOGLE ERROR:", str(e))
+         return redirect("http://localhost:5173/login?error=google_failed")
+
+    email = userinfo.get('email')
+    user = User.query.filter_by(email=email).first()
+
+    if not user:
+        username = email.split('@')[0]
+        counter = 1
+        base = username
+        while User.query.filter_by(username=username).first():
+            username = f"{base}{counter}"
+            counter += 1
+        user = User(username=username, email=email)
+        user.password_hash = generate_password_hash("oauth-placeholder")
+        db.session.add(user)
+        db.session.commit()
+
+    access_token = create_access_token(identity=str(user.id))
+    return redirect(f"http://localhost:5173/auth/callback?token={access_token}")
+
+
+@auth_bp.route("/reset", methods=["POST"])
+def reset_request():
+    data = request.json
+    email = data.get("email")
+    user = User.query.filter_by(email=email).first()
+
+    if user:
+        token = generate_reset_token(email)
+        reset_link = f"http://localhost:5173/reset-password?token={token}"
+        msg = Message(
+            "Password Reset Request",
+            sender=current_app.config.get("MAIL_USERNAME"),
+            recipients=[email]
+        )
+        msg.body = f"To reset your password visit: {reset_link}"
+        try:
+            mail.send(msg)
+        except Exception as e:
+            return jsonify({"error": f"Email failed: {str(e)}"}), 500
+        return jsonify({"message": "Reset link sent"}), 200
+    return jsonify({"error": "Email not found"}), 404
+
+
+@auth_bp.route("/reset/<token>", methods=["POST"])
+def reset_with_token(token):
+    email = confirm_reset_token(token)
+    if not email:
+        return jsonify({"error": "Invalid or expired token"}), 400
+
+    data = request.json
+    password = data.get("password")
+    user = User.query.filter_by(email=email).first()
+    user.password_hash = generate_password_hash(password)
+    db.session.commit()
+    return jsonify({"message": "Password updated successfully"}), 200
+
+
+@auth_bp.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"message": "Logged out"}), 200
+
+
+@auth_bp.route('/profile')
+def profile():
+    from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity
+    try:
+        verify_jwt_in_request()
+        user_id = get_jwt_identity()
+    except:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    user = User.query.get(int(user_id))
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify({
+        "id": user.id,
+        "username": user.username,
+        "role": getattr(user, 'role', 'user'),
+        "email": user.email
+    })
